@@ -1,0 +1,32 @@
+services:
+  corsproxy:
+    build: ./corsproxy
+    container_name: corsproxy
+    expose:
+      - "8080"
+    environment:
+      - ALLOWED_ORIGINS=https://budabit.club,https://test.budabit.club
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.26-alpine
+    container_name: nginx
+    depends_on:
+      - corsproxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/certs:/etc/letsencrypt
+      - ./nginx/www:/var/www/html
+    restart: unless-stopped
+
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    volumes:
+      - ./nginx/certs:/etc/letsencrypt
+      - ./nginx/www:/var/www/html
+    entrypoint: >
+      sh -c "trap exit TERM; while :; do sleep 12h & wait $${!}; certbot renew; done"
