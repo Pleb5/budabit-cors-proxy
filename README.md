@@ -39,3 +39,17 @@ Therefore BudaBit runs this proxy server while allowing users to set their own t
 6. On the VPS cd into project dir and spin up the containers: ``bash docker compose up -d nginx corsproxy``
 7. Test the proxy in the browser
     - https://corsproxy.budabit.club/?url=https://api.github.com/users/Pleb5
+
+### TLS certificates
+- Nginx serves ACME HTTP-01 challenges from `/var/www/html/.well-known/acme-challenge` (see `nginx/conf.d/corsproxy.conf`). Do not redirect this path.
+- Issue or renew a certificate:
+    - ``bash
+    docker compose run --rm --entrypoint certbot certbot certonly \
+      --webroot -w /var/www/html \
+      -d corsproxy.budabit.club \
+      --email you@example.com --agree-tos --no-eff-email --non-interactive
+    ``
+    - ``bash docker compose exec nginx nginx -s reload``
+- Keep auto-renew running:
+    - ``bash docker compose up -d certbot``
+    - ``bash docker compose run --rm --entrypoint certbot certbot renew --dry-run``
