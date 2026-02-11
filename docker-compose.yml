@@ -1,6 +1,8 @@
 services:
   corsproxy:
-    build: ./corsproxy
+    build:
+      context: .
+      dockerfile: corsproxy/Dockerfile
     container_name: corsproxy
     expose:
       - "8080"

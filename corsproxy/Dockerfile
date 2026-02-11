@@ -1,8 +1,9 @@
 FROM golang:1.24-alpine AS builder
 WORKDIR /app
-COPY . .
+COPY go.mod ./
+COPY corsproxy ./corsproxy
 RUN go mod download
-RUN go build -o corsproxy
+RUN go build -o corsproxy ./corsproxy
 
 FROM alpine:3.20
 WORKDIR /app
