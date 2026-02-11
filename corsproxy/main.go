@@ -100,7 +100,7 @@ func handleRequestAndRedirect(w http.ResponseWriter, req *http.Request) {
 	// --- Copy response headers ---
 	for k, v := range resp.Header {
 		for _, val := range v {
-			if strings.EqualFold(k, "Content-Length") {
+			if shouldSkipResponseHeader(k) {
 				continue
 			}
 			w.Header().Add(k, val)
@@ -115,6 +115,16 @@ func handleRequestAndRedirect(w http.ResponseWriter, req *http.Request) {
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func shouldSkipResponseHeader(name string) bool {
+	if strings.EqualFold(name, "Content-Length") {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(name), "access-control-") {
+		return true
+	}
+	return false
 }
 
 // rewriteLocation converts e.g. https://github.com/... -> /github.com/...
