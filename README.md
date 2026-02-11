@@ -50,6 +50,7 @@ Therefore BudaBit runs this proxy server while allowing users to set their own t
       --email you@example.com --agree-tos --no-eff-email --non-interactive
     ``
     - ``bash docker compose exec nginx nginx -s reload``
-- Keep auto-renew running:
+- Keep auto-renew running (nginx reloads automatically after successful renewal):
     - ``bash docker compose up -d certbot``
     - ``bash docker compose run --rm --entrypoint certbot certbot renew --dry-run``
+- Auto-reload uses a deploy hook with a shared PID namespace (see `docker-compose.yml`). The hook logs to the certbot container output.
