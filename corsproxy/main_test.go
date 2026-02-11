@@ -1,0 +1,175 @@
+package main
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func setAllowedOrigins(t *testing.T, origins []string) {
+	t.Helper()
+	old := allowedOrigins
+	allowedOrigins = append([]string(nil), origins...)
+	t.Cleanup(func() {
+		allowedOrigins = old
+	})
+}
+
+func trustTLSServer(t *testing.T, ts *httptest.Server) {
+	t.Helper()
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Fatalf("http.DefaultTransport type %T", http.DefaultTransport)
+	}
+	clientTransport, ok := ts.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("tls client transport type %T", ts.Client().Transport)
+	}
+	oldTLS := transport.TLSClientConfig
+	transport.TLSClientConfig = clientTransport.TLSClientConfig
+	transport.CloseIdleConnections()
+	t.Cleanup(func() {
+		transport.TLSClientConfig = oldTLS
+		transport.CloseIdleConnections()
+	})
+}
+
+func TestAllowCorsForOrigin(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+
+	if !allowCorsForOrigin("https://budabit.club") {
+		t.Fatalf("expected allowlist origin to be allowed")
+	}
+	if allowCorsForOrigin("https://example.com") {
+		t.Fatalf("expected non-allowlist origin to be denied")
+	}
+}
+
+func TestAllowCorsForOriginLocalhost(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+
+	if !allowCorsForOrigin("http://localhost:3000") {
+		t.Fatalf("expected localhost to be allowed")
+	}
+	if !allowCorsForOrigin("http://127.0.0.1:3000") {
+		t.Fatalf("expected 127.0.0.1 to be allowed")
+	}
+}
+
+func TestRewriteLocation(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.local/github.com/owner/repo", nil)
+
+	loc := rewriteLocation("https://github.com/owner/repo?x=1", req)
+	if loc != "/github.com/owner/repo?x=1" {
+		t.Fatalf("unexpected rewritten location: %s", loc)
+	}
+
+	loc = rewriteLocation("/relative/path", req)
+	if loc != "/relative/path" {
+		t.Fatalf("unexpected relative location: %s", loc)
+	}
+}
+
+func TestHandleRequestInvalidPath(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.local/", nil)
+	rec := httptest.NewRecorder()
+
+	handleRequestAndRedirect(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Invalid path") {
+		t.Fatalf("expected invalid path response, got %q", string(body))
+	}
+}
+
+func TestHandleRequestPreflight(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+	req := httptest.NewRequest(http.MethodOptions, "http://proxy.local/github.com/owner/repo", nil)
+	req.Header.Set("Origin", "https://budabit.club")
+	rec := httptest.NewRecorder()
+
+	handleRequestAndRedirect(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://budabit.club" {
+		t.Fatalf("unexpected allow origin header: %q", got)
+	}
+}
+
+func TestHandleRequestProxyAndRewrite(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+
+	var gotUserAgent string
+	var gotPath string
+	var gotQuery string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Location", "https://example.com/redirect?ok=1")
+		w.Header().Set("Content-Length", "123")
+		w.WriteHeader(http.StatusFound)
+		io.WriteString(w, "redirected")
+	}))
+	defer upstream.Close()
+	trustTLSServer(t, upstream)
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"http://proxy.local/"+upstreamURL.Host+"/owner/repo?ref=main",
+		nil,
+	)
+	req.Header.Set("Origin", "https://budabit.club")
+	rec := httptest.NewRecorder()
+
+	handleRequestAndRedirect(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected status %d, got %d", http.StatusFound, resp.StatusCode)
+	}
+	if gotPath != "/owner/repo" {
+		t.Fatalf("unexpected upstream path: %q", gotPath)
+	}
+	if gotQuery != "ref=main" {
+		t.Fatalf("unexpected upstream query: %q", gotQuery)
+	}
+	if gotUserAgent != "git/budabit-go-cors-proxy" {
+		t.Fatalf("unexpected upstream user agent: %q", gotUserAgent)
+	}
+	if got := resp.Header.Get("Location"); got != "/example.com/redirect?ok=1" {
+		t.Fatalf("unexpected location header: %q", got)
+	}
+	if got := resp.Header.Get("X-Redirected-URL"); got != "/example.com/redirect?ok=1" {
+		t.Fatalf("unexpected redirected header: %q", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://budabit.club" {
+		t.Fatalf("unexpected allow origin header: %q", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "" {
+		t.Fatalf("expected no content-length header, got %q", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "redirected" {
+		t.Fatalf("unexpected body: %q", string(body))
+	}
+}
