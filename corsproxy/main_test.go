@@ -18,6 +18,15 @@ func setAllowedOrigins(t *testing.T, origins []string) {
 	})
 }
 
+func setAllowPrivateTargets(t *testing.T, value bool) {
+	t.Helper()
+	old := allowPrivateTargets
+	allowPrivateTargets = value
+	t.Cleanup(func() {
+		allowPrivateTargets = old
+	})
+}
+
 func trustTLSServer(t *testing.T, ts *httptest.Server) {
 	t.Helper()
 	transport, ok := http.DefaultTransport.(*http.Transport)
@@ -86,14 +95,18 @@ func TestHandleRequestInvalidPath(t *testing.T) {
 		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "Invalid path") {
+	if !strings.Contains(string(body), "invalid path") {
 		t.Fatalf("expected invalid path response, got %q", string(body))
 	}
 }
 
 func TestHandleRequestPreflight(t *testing.T) {
 	setAllowedOrigins(t, []string{"https://budabit.club"})
-	req := httptest.NewRequest(http.MethodOptions, "http://proxy.local/github.com/owner/repo", nil)
+	req := httptest.NewRequest(
+		http.MethodOptions,
+		"http://proxy.local/github.com/owner/repo.git/info/refs?service=git-upload-pack",
+		nil,
+	)
 	req.Header.Set("Origin", "https://budabit.club")
 	rec := httptest.NewRecorder()
 
@@ -101,8 +114,8 @@ func TestHandleRequestPreflight(t *testing.T) {
 
 	resp := rec.Result()
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status %d, got %d", http.StatusNoContent, resp.StatusCode)
 	}
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://budabit.club" {
 		t.Fatalf("unexpected allow origin header: %q", got)
@@ -111,6 +124,7 @@ func TestHandleRequestPreflight(t *testing.T) {
 
 func TestHandleRequestProxyAndRewrite(t *testing.T) {
 	setAllowedOrigins(t, []string{"https://budabit.club"})
+	setAllowPrivateTargets(t, true)
 
 	var gotUserAgent string
 	var gotPath string
@@ -134,7 +148,7 @@ func TestHandleRequestProxyAndRewrite(t *testing.T) {
 
 	req := httptest.NewRequest(
 		http.MethodGet,
-		"http://proxy.local/"+upstreamURL.Host+"/owner/repo?ref=main",
+		"http://proxy.local/"+upstreamURL.Host+"/owner/repo.git/info/refs?service=git-upload-pack",
 		nil,
 	)
 	req.Header.Set("Origin", "https://budabit.club")
@@ -147,10 +161,10 @@ func TestHandleRequestProxyAndRewrite(t *testing.T) {
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("expected status %d, got %d", http.StatusFound, resp.StatusCode)
 	}
-	if gotPath != "/owner/repo" {
+	if gotPath != "/owner/repo.git/info/refs" {
 		t.Fatalf("unexpected upstream path: %q", gotPath)
 	}
-	if gotQuery != "ref=main" {
+	if gotQuery != "service=git-upload-pack" {
 		t.Fatalf("unexpected upstream query: %q", gotQuery)
 	}
 	if gotUserAgent != "git/budabit-go-cors-proxy" {
@@ -171,5 +185,27 @@ func TestHandleRequestProxyAndRewrite(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "redirected" {
 		t.Fatalf("unexpected body: %q", string(body))
+	}
+}
+
+func TestHandleRequestRejectsNonGitPath(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.local/github.com/.git/config", nil)
+	req.Header.Set("Origin", "https://budabit.club")
+	rec := httptest.NewRecorder()
+
+	handleRequestAndRedirect(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected status %d, got %d", http.StatusForbidden, resp.StatusCode)
+	}
+}
+
+func TestValidateTargetHostRejectsPrivateIP(t *testing.T) {
+	setAllowPrivateTargets(t, false)
+	if err := validateTargetHost("127.0.0.1"); err == nil {
+		t.Fatalf("expected private IP to be rejected")
 	}
 }

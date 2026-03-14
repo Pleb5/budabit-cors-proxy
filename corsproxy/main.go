@@ -1,15 +1,26 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
 var allowedOrigins []string
+var allowPrivateTargets bool
+
+var targetPathPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+\.git/(info/refs|git-upload-pack|git-receive-pack)$`)
+
+func init() {
+	allowPrivateTargets = strings.EqualFold(strings.TrimSpace(os.Getenv("ALLOW_PRIVATE_TARGETS")), "true")
+}
 
 func main() {
 	env := os.Getenv("ALLOWED_ORIGINS")
@@ -37,26 +48,42 @@ func handleRequestAndRedirect(w http.ResponseWriter, req *http.Request) {
 	} else if isAllowedOrigin("*") {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Git-Protocol, X-Requested-With, Origin, Accept")
 	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Date, ETag, Location, Server, X-Redirected-URL")
+	w.Header().Set("Vary", "Origin")
+
+	targetHost, remaining, err := parseProxyPath(req.URL.Path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := validateTargetHost(targetHost); err != nil {
+		log.Printf("Rejected %s %s from %s: target host validation failed: %v", req.Method, req.URL.String(), req.RemoteAddr, err)
+		http.Error(w, "Forbidden target host", http.StatusForbidden)
+		return
+	}
+
+	if err := validateGitSmartHTTPRequest(req.Method, remaining, req.URL.Query()); err != nil {
+		log.Printf("Rejected %s %s from %s: git endpoint validation failed: %v", req.Method, req.URL.String(), req.RemoteAddr, err)
+		http.Error(w, "Forbidden request path", http.StatusForbidden)
+		return
+	}
 
 	// Preflight
 	if req.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if req.Method != http.MethodGet && req.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// --- Parse target URL ---
-	pathParts := strings.SplitN(strings.TrimPrefix(req.URL.Path, "/"), "/", 2)
-	if len(pathParts) < 2 {
-		http.Error(w, "Invalid path", http.StatusBadRequest)
-		return
-	}
-
-	domain := pathParts[0]
-	remaining := pathParts[1]
-	targetURL := "https://" + domain + "/" + remaining
+	targetURL := "https://" + targetHost + "/" + remaining
 	if req.URL.RawQuery != "" {
 		targetURL += "?" + req.URL.RawQuery
 	}
@@ -115,6 +142,129 @@ func handleRequestAndRedirect(w http.ResponseWriter, req *http.Request) {
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func parseProxyPath(path string) (string, string, error) {
+	pathParts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
+	if len(pathParts) < 2 {
+		return "", "", fmt.Errorf("invalid path")
+	}
+
+	targetHost := strings.TrimSpace(pathParts[0])
+	remaining := strings.TrimSpace(pathParts[1])
+	if targetHost == "" || remaining == "" {
+		return "", "", fmt.Errorf("invalid path")
+	}
+
+	return targetHost, remaining, nil
+}
+
+func validateTargetHost(targetHost string) error {
+	host := targetHost
+	if strings.Contains(targetHost, ":") {
+		parsedHost, port, err := net.SplitHostPort(targetHost)
+		if err != nil {
+			return fmt.Errorf("invalid target host/port")
+		}
+		if _, err := strconv.Atoi(port); err != nil {
+			return fmt.Errorf("invalid target port")
+		}
+		host = parsedHost
+	}
+
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return fmt.Errorf("missing target host")
+	}
+	if strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") || strings.Contains(host, "..") {
+		return fmt.Errorf("invalid target host")
+	}
+	if strings.ContainsAny(host, "/\\?&#%") {
+		return fmt.Errorf("invalid target host")
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		if allowPrivateTargets {
+			return nil
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("private/internal IP targets are not allowed")
+		}
+		return nil
+	}
+
+	if !strings.Contains(host, ".") {
+		return fmt.Errorf("target host must be a fully-qualified domain")
+	}
+
+	blockedSuffixes := []string{".local", ".localhost", ".internal", ".lan", ".home"}
+	for _, suffix := range blockedSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			if allowPrivateTargets {
+				break
+			}
+			return fmt.Errorf("private/internal target host is not allowed")
+		}
+	}
+
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return fmt.Errorf("target host must contain a TLD")
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return fmt.Errorf("invalid host label")
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("invalid host label")
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-' {
+				return fmt.Errorf("invalid host label")
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateGitSmartHTTPRequest(method, remaining string, query url.Values) error {
+	if method != http.MethodGet && method != http.MethodPost && method != http.MethodOptions {
+		return fmt.Errorf("method not allowed")
+	}
+
+	if strings.Contains(remaining, "\\") || strings.Contains(remaining, "..") {
+		return fmt.Errorf("invalid path")
+	}
+
+	if !targetPathPattern.MatchString(remaining) {
+		return fmt.Errorf("path is not a git smart-http endpoint")
+	}
+
+	gitEndpointIdx := strings.LastIndex(remaining, ".git/")
+	if gitEndpointIdx == -1 {
+		return fmt.Errorf("invalid git endpoint")
+	}
+	endpoint := remaining[gitEndpointIdx+5:]
+
+	switch endpoint {
+	case "info/refs":
+		service := query.Get("service")
+		if service != "git-upload-pack" && service != "git-receive-pack" {
+			return fmt.Errorf("invalid info/refs service")
+		}
+		if method != http.MethodGet && method != http.MethodOptions {
+			return fmt.Errorf("info/refs only supports GET")
+		}
+	case "git-upload-pack", "git-receive-pack":
+		if method != http.MethodPost && method != http.MethodOptions {
+			return fmt.Errorf("pack endpoints only support POST")
+		}
+	default:
+		return fmt.Errorf("unsupported git endpoint")
+	}
+
+	return nil
 }
 
 func shouldSkipResponseHeader(name string) bool {
