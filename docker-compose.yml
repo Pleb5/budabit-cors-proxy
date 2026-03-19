@@ -7,7 +7,7 @@ services:
     expose:
       - "8080"
     environment:
-      - ALLOWED_ORIGINS=https://budabit.club,https://test.budabit.club
+      - ALLOWED_ORIGINS=https://budabit.club,https://test.budabit.club,https://dev.budabit.club
     restart: unless-stopped
 
   nginx:

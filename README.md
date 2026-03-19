@@ -23,7 +23,7 @@ Therefore BudaBit runs this proxy server while allowing users to set their own t
 ### How to use it
 1. In docker-compose.yaml set the ALLOWED_ORIGINS env variable for your sites. e.g.:
    - environment:
-      - ALLOWED_ORIGINS=https://budabit.club,https://test.budabit.club
+      - ALLOWED_ORIGINS=https://budabit.club,https://test.budabit.club,https://dev.budabit.club
 2. Test if the proxy is working locally:
     - ``bash 
     export ALLOWED_ORIGINS="localhost"

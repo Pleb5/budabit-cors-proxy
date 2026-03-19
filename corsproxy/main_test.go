@@ -57,6 +57,14 @@ func TestAllowCorsForOrigin(t *testing.T) {
 	}
 }
 
+func TestAllowCorsForOriginDevDomain(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club", "https://dev.budabit.club"})
+
+	if !allowCorsForOrigin("https://dev.budabit.club") {
+		t.Fatalf("expected dev origin to be allowed")
+	}
+}
+
 func TestAllowCorsForOriginLocalhost(t *testing.T) {
 	setAllowedOrigins(t, []string{"https://budabit.club"})
 
