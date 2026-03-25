@@ -16,7 +16,7 @@ import (
 var allowedOrigins []string
 var allowPrivateTargets bool
 
-var targetPathPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+\.git/(info/refs|git-upload-pack|git-receive-pack)$`)
+var targetPathSegmentPattern = regexp.MustCompile(`^(?:[A-Za-z0-9._~+\-@]|%[0-9A-Fa-f]{2})+$`)
 
 func init() {
 	allowPrivateTargets = strings.EqualFold(strings.TrimSpace(os.Getenv("ALLOW_PRIVATE_TARGETS")), "true")
@@ -65,7 +65,8 @@ func handleRequestAndRedirect(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := validateGitSmartHTTPRequest(req.Method, remaining, req.URL.Query()); err != nil {
+	normalizedRemaining, err := validateGitSmartHTTPRequest(req.Method, remaining, req.URL.Query())
+	if err != nil {
 		log.Printf("Rejected %s %s from %s: git endpoint validation failed: %v", req.Method, req.URL.String(), req.RemoteAddr, err)
 		http.Error(w, "Forbidden request path", http.StatusForbidden)
 		return
@@ -83,7 +84,7 @@ func handleRequestAndRedirect(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// --- Parse target URL ---
-	targetURL := "https://" + targetHost + "/" + remaining
+	targetURL := "https://" + targetHost + "/" + normalizedRemaining
 	if req.URL.RawQuery != "" {
 		targetURL += "?" + req.URL.RawQuery
 	}
@@ -228,43 +229,81 @@ func validateTargetHost(targetHost string) error {
 	return nil
 }
 
-func validateGitSmartHTTPRequest(method, remaining string, query url.Values) error {
+func validateGitSmartHTTPRequest(method, remaining string, query url.Values) (string, error) {
 	if method != http.MethodGet && method != http.MethodPost && method != http.MethodOptions {
-		return fmt.Errorf("method not allowed")
+		return "", fmt.Errorf("method not allowed")
 	}
 
-	if strings.Contains(remaining, "\\") || strings.Contains(remaining, "..") {
-		return fmt.Errorf("invalid path")
+	if strings.Contains(remaining, "\\") {
+		return "", fmt.Errorf("invalid path")
 	}
 
-	if !targetPathPattern.MatchString(remaining) {
-		return fmt.Errorf("path is not a git smart-http endpoint")
+	repoPath, endpoint, err := splitGitSmartHTTPRequestPath(remaining)
+	if err != nil {
+		return "", err
 	}
 
-	gitEndpointIdx := strings.LastIndex(remaining, ".git/")
-	if gitEndpointIdx == -1 {
-		return fmt.Errorf("invalid git endpoint")
+	normalizedRepoPath, err := normalizeGitRepoPath(repoPath)
+	if err != nil {
+		return "", err
 	}
-	endpoint := remaining[gitEndpointIdx+5:]
 
 	switch endpoint {
 	case "info/refs":
 		service := query.Get("service")
 		if service != "git-upload-pack" && service != "git-receive-pack" {
-			return fmt.Errorf("invalid info/refs service")
+			return "", fmt.Errorf("invalid info/refs service")
 		}
 		if method != http.MethodGet && method != http.MethodOptions {
-			return fmt.Errorf("info/refs only supports GET")
+			return "", fmt.Errorf("info/refs only supports GET")
 		}
 	case "git-upload-pack", "git-receive-pack":
 		if method != http.MethodPost && method != http.MethodOptions {
-			return fmt.Errorf("pack endpoints only support POST")
+			return "", fmt.Errorf("pack endpoints only support POST")
 		}
 	default:
-		return fmt.Errorf("unsupported git endpoint")
+		return "", fmt.Errorf("unsupported git endpoint")
 	}
 
-	return nil
+	return normalizedRepoPath + "/" + endpoint, nil
+}
+
+func splitGitSmartHTTPRequestPath(remaining string) (string, string, error) {
+	for _, endpoint := range []string{"info/refs", "git-upload-pack", "git-receive-pack"} {
+		suffix := "/" + endpoint
+		if strings.HasSuffix(remaining, suffix) {
+			repoPath := strings.TrimSuffix(remaining, suffix)
+			if repoPath == "" {
+				return "", "", fmt.Errorf("missing repository path")
+			}
+			return repoPath, endpoint, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("path is not a git smart-http endpoint")
+}
+
+func normalizeGitRepoPath(repoPath string) (string, error) {
+	trimmed := strings.Trim(strings.TrimSpace(repoPath), "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("missing repository path")
+	}
+
+	segments := strings.Split(trimmed, "/")
+	if len(segments) < 2 {
+		return "", fmt.Errorf("repository path must include owner and repo")
+	}
+
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("invalid path")
+		}
+		if !targetPathSegmentPattern.MatchString(segment) {
+			return "", fmt.Errorf("invalid repository path segment")
+		}
+	}
+
+	return strings.Join(segments, "/"), nil
 }
 
 func shouldSkipResponseHeader(name string) bool {

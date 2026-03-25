@@ -130,6 +130,25 @@ func TestHandleRequestPreflight(t *testing.T) {
 	}
 }
 
+func TestHandleRequestPreflightWithoutDotGit(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+	req := httptest.NewRequest(
+		http.MethodOptions,
+		"http://proxy.local/github.com/owner/repo/info/refs?service=git-upload-pack",
+		nil,
+	)
+	req.Header.Set("Origin", "https://budabit.club")
+	rec := httptest.NewRecorder()
+
+	handleRequestAndRedirect(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status %d, got %d", http.StatusNoContent, resp.StatusCode)
+	}
+}
+
 func TestHandleRequestProxyAndRewrite(t *testing.T) {
 	setAllowedOrigins(t, []string{"https://budabit.club"})
 	setAllowPrivateTargets(t, true)
@@ -196,6 +215,53 @@ func TestHandleRequestProxyAndRewrite(t *testing.T) {
 	}
 }
 
+func TestHandleRequestAllowsMissingDotGit(t *testing.T) {
+	setAllowedOrigins(t, []string{"https://budabit.club"})
+	setAllowPrivateTargets(t, true)
+
+	var gotPath string
+	var gotQuery string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+	trustTLSServer(t, upstream)
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"http://proxy.local/"+upstreamURL.Host+"/owner/repo/info/refs?service=git-upload-pack",
+		nil,
+	)
+	req.Header.Set("Origin", "https://budabit.club")
+	rec := httptest.NewRecorder()
+
+	handleRequestAndRedirect(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+	if gotPath != "/owner/repo/info/refs" {
+		t.Fatalf("unexpected upstream path: %q", gotPath)
+	}
+	if gotQuery != "service=git-upload-pack" {
+		t.Fatalf("unexpected upstream query: %q", gotQuery)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Fatalf("unexpected body: %q", string(body))
+	}
+}
+
 func TestHandleRequestRejectsNonGitPath(t *testing.T) {
 	setAllowedOrigins(t, []string{"https://budabit.club"})
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.local/github.com/.git/config", nil)
@@ -215,5 +281,47 @@ func TestValidateTargetHostRejectsPrivateIP(t *testing.T) {
 	setAllowPrivateTargets(t, false)
 	if err := validateTargetHost("127.0.0.1"); err == nil {
 		t.Fatalf("expected private IP to be rejected")
+	}
+}
+
+func TestValidateGitSmartHTTPRequestAllowsMissingDotGit(t *testing.T) {
+	normalized, err := validateGitSmartHTTPRequest(
+		http.MethodGet,
+		"owner/repo/info/refs",
+		url.Values{"service": {"git-upload-pack"}},
+	)
+	if err != nil {
+		t.Fatalf("expected request to validate: %v", err)
+	}
+	if normalized != "owner/repo/info/refs" {
+		t.Fatalf("unexpected normalized path: %q", normalized)
+	}
+}
+
+func TestValidateGitSmartHTTPRequestAllowsSourceHutStylePath(t *testing.T) {
+	normalized, err := validateGitSmartHTTPRequest(
+		http.MethodGet,
+		"~sircmpwn/scdoc/info/refs",
+		url.Values{"service": {"git-upload-pack"}},
+	)
+	if err != nil {
+		t.Fatalf("expected sourcehut-style path to validate: %v", err)
+	}
+	if normalized != "~sircmpwn/scdoc/info/refs" {
+		t.Fatalf("unexpected normalized path: %q", normalized)
+	}
+}
+
+func TestValidateGitSmartHTTPRequestAllowsEncodedSegments(t *testing.T) {
+	normalized, err := validateGitSmartHTTPRequest(
+		http.MethodGet,
+		"group/%40team/repo/info/refs",
+		url.Values{"service": {"git-upload-pack"}},
+	)
+	if err != nil {
+		t.Fatalf("expected encoded path to validate: %v", err)
+	}
+	if normalized != "group/%40team/repo/info/refs" {
+		t.Fatalf("unexpected normalized path: %q", normalized)
 	}
 }
