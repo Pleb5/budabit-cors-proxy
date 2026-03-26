@@ -1,3 +1,4 @@
 .direnv/*
 .go/*
 .envrc
+nginx/certs/**
